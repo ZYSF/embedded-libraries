@@ -47,6 +47,7 @@ struct elmm_smallchunk {
     uintptr_t check2; /* Either ELMM_SMALLCHUNK_FREE or ELMM_SMALLCHUNK_ALLOCATED.*/
 };
 
+/* Internal elements of a bigchunk*/
 typedef struct elmm_bigchunk_internals elmm_bigchunk_internals_t;
 typedef struct elmm_bigchunk elmm_bigchunk_t;
 struct elmm_bigchunk_internals {
@@ -75,7 +76,8 @@ struct elmm_bigchunk {
  * Unused fields of the bigchunk structure
  * should be cleared to zero, but the rest of the memory doesn't necessarily need to be cleared
  * (it probably should be anyway for security reasons, but the allocator will clear it itself
- * anyway).
+ * anyway). The total size of a bigchunk is expected to always include the header (the header is
+ * part of the chunk, and only needs to be separated by it's own headerSize field).
  *
  * If the oldchunk is non-null and the size is zero, the function should deallocate that chunk
  * entirely (or set it to it's minimum size, depending on implementation), and return NULL (if
@@ -126,9 +128,12 @@ struct elmm_sbrk_data {
     elmm_bigchunk_t* onlyChunk;
 };
 
+/* This function can be used as the bigchunk function if you need it to work on top of a "sbrk"-like API.
+ * A elmm_sbrk_data_t should be given as the userdata, and it holds a pointer to an sbrk-like function.
+ */
 ELMM_STATIC elmm_bigchunk_t* elmm_bigchunk_sbrk(uintptr_t size, elmm_bigchunk_t* oldchunk, void* udata) {
     elmm_sbrk_data_t* data = (elmm_sbrk_data_t*)udata;
-    printf("elmm_bigchunk_sbrk(%d,%d,%d)\n", size, oldchunk, udata);
+    //printf("elmm_bigchunk_sbrk(%d,%d,%d)\n", size, oldchunk, udata);
     if (size > 0 && oldchunk == NULL) {
         if (data->onlyChunk != NULL) {
             return NULL;
@@ -144,7 +149,7 @@ ELMM_STATIC elmm_bigchunk_t* elmm_bigchunk_sbrk(uintptr_t size, elmm_bigchunk_t*
         return data->onlyChunk;
     }
     else {
-        printf("TODO!!!\n");
+        //printf("TODO!!!\n");
         return NULL;
     }
 }
@@ -169,6 +174,11 @@ ELMM_STATIC elmm_bigchunk_t* elmm_bigchunk_sbrk(uintptr_t size, elmm_bigchunk_t*
 
 typedef bool (*elmm_lock_function_t)(int command, void** lockVarible, void* udata);
 
+/* This function is used internally as the lock function if no other one is provided.
+ * (The current implementation doesn't perform any checks, it just sets the lock to
+ * NULL and reports success. Future versions might at least attempt to make sure
+ * the commands are issued in the correct order.)
+ */
 ELMM_STATIC bool elmm_nolock(int command, void** lockVariable, void* udata) {
     *lockVariable = NULL;
     return true;
@@ -207,6 +217,7 @@ struct elmm {
 #define ELMM_STAT_OVERHEADS     4
 #define ELMM_STATTOP            5
 
+/* Called internally by elmm_innerstat to add up the "size" elements of each smallchunk in the given list. */
 ELMM_INLINE uintptr_t elmm_innerstatpart(elmm_t* mm, elmm_smallchunk_t* listHead) {
     uintptr_t result = 0;
 
@@ -285,7 +296,7 @@ ELMM_STATIC elmm_bigchunk_t* elmm_allocinner(elmm_t* mm, uintptr_t minsize) {
     }
     elmm_bigchunk_t* result = mm->bigchunkFunction(minsize, NULL, mm->bigchunkData);
     if (result == NULL) {
-        printf("BIGCHUNK FUNCTION GAVE US NULL!\n");
+        //printf("BIGCHUNK FUNCTION GAVE US NULL!\n");
         return NULL;
     }
     if (result->headerSize > sizeof(elmm_bigchunk_t)) {
@@ -316,6 +327,20 @@ ELMM_STATIC elmm_bigchunk_t* elmm_allocinner(elmm_t* mm, uintptr_t minsize) {
     return result;
 }
 
+/* Must be called before any other functions to initialise a memory manager.
+ * The memory manager structure itself is provided by the caller, and at a minimum it should have it's
+ * bigchunkFunction set to an appropriate value (all unused fields should be cleared to zero/NULL before
+ * initialisation).
+ *
+ * NOTE: The reason the init function needs to be called explicitly (rather than automatically e.g. in the
+ * first call to "elmm_malloc") is just because of edge-cases involving multithreaded programs: If the
+ * memory manager isn't used before creating a second thread, then calling elmm_malloc at the same time from any
+ * two threads could lead to both threads trying to initialise the structure at the same time (which is
+ * critical because the initialisation function needs to initialise any locks which would normally safely
+ * synchronise multithreaded access). This shouldn't be an issue in many cases, so in a wrapper function
+ * you could just check the "initialised" field and initialise whenever necessary (but there would probably
+ * be a better place to put the initialisation call in most cases anyway).
+ */
 ELMM_STATIC bool elmm_init(elmm_t* mm) {
     if (mm == NULL) {
         return false;
@@ -355,7 +380,7 @@ ELMM_STATIC bool elmm_init(elmm_t* mm) {
 
     mm->firstChunk = elmm_allocinner(mm, mm->bigchunkMinimum);
     if (mm->firstChunk == NULL) {
-        printf("ALLOC FAILED\n");
+        //printf("ALLOC FAILED\n");
         return false;
     }
 
@@ -382,6 +407,11 @@ ELMM_INLINE bool elmm_checkinit(elmm_t* mm) {
     }
 }
 
+/* The inverse of elmm_init. Should be called when the heap is completely finished to deallocate any remaining chunks. In
+ * practice, if only one heap is used for the entire duration of a program then a program doesn't really need to clean it up
+ * (all of the program's memory would normally be reclaimed when the program ends anyway), but if multiple heaps are used
+ * it may become necessary to deallocate some of them individually.
+ */
 ELMM_INLINE bool elmm_cleanup(elmm_t* mm) {
     if (mm == NULL || mm->bigchunkFunction == NULL || mm->lockFunction == NULL) {
         return false;
@@ -481,9 +511,9 @@ ELMM_INLINE void* elmm_chunkymalloc(elmm_t* mm, elmm_bigchunk_t* bigchunk, uintp
     elmm_smallchunk_t* chunk = bigchunk->internals.firstFree;
     while (chunk != NULL) {
         if (chunk->size >= size) {
-            printf("Can fit\n");
+            //printf("Can fit\n");
             if (chunk->size >= size + (2 * sizeof(elmm_smallchunk_t))) {
-                printf("Will split\n");
+                //printf("Will split\n");
                 uint8_t* rawbytes = (uint8_t*) chunk;
                 elmm_smallchunk_t* upperchunk = (elmm_smallchunk_t*)(rawbytes + sizeof(elmm_smallchunk_t) + size);
                 while ((((uintptr_t)upperchunk) % sizeof(elmm_smallchunk_t)) != 0) {
@@ -496,7 +526,7 @@ ELMM_INLINE void* elmm_chunkymalloc(elmm_t* mm, elmm_bigchunk_t* bigchunk, uintp
                 upperchunk->next = chunk->next;
                 upperchunk->check2 = ELMM_SMALLCHUNK_FREE;
                 chunk->next = upperchunk;
-                printf("Splitted one chunk of %d into two chunks of %d and %d\n", oldsize, chunk->size, upperchunk->size);
+                //printf("Splitted one chunk of %d into two chunks of %d and %d\n", oldsize, chunk->size, upperchunk->size);
             }
             *chunkptr = chunk->next;
             chunk->check1 = ELMM_SMALLCHUNK_ALLOCATED;
@@ -560,6 +590,7 @@ ELMM_INLINE void* elmm_malloc(elmm_t* mm, uintptr_t size) {
     return result;
 }
 
+/* Only used internally by elmm_free to find the bigchunk which the data at the given pointer would reside in. */
 ELMM_INLINE elmm_bigchunk_t* elmm_innerchunk(elmm_t* mm, void* pointer) {
     elmm_bigchunk_t* chunk = mm->firstChunk;
     while (chunk != NULL) {
@@ -573,6 +604,7 @@ ELMM_INLINE elmm_bigchunk_t* elmm_innerchunk(elmm_t* mm, void* pointer) {
     return NULL;
 }
 
+/* Only used internally by elmm_free to unlink a smallchunk element from a list. */
 ELMM_INLINE bool elmm_innerunlink(elmm_t* mm, elmm_smallchunk_t** listVariable, elmm_smallchunk_t* element) {
     if (element == *listVariable) {
         *listVariable = element->next;
@@ -696,13 +728,13 @@ ELMM_INLINE intptr_t elmm_innercompact(elmm_t* mm, elmm_bigchunk_t* bigchunk) {
         uintptr_t addr1 = (uintptr_t)chunk;
         uintptr_t addr2 = (uintptr_t)chunk->next;
         if (chunk->next != NULL && addr1 > addr2) { /* Sorting is required. */
-            printf("I'm going to sort chunks %d and %d into correct order...\n", addr1, addr2);
+            //printf("I'm going to sort chunks %d and %d into correct order...\n", addr1, addr2);
             *chunkvar = chunk->next;
             chunk->next = (*chunkvar)->next;
             (*chunkvar)->next = chunk;
             result++;
         } else if (addr2 == (addr1 + sizeof(elmm_smallchunk_t) + chunk->size)) {
-            printf("I'm going to compact chunks %d and %d into one chunk...\n", addr1, addr2);
+            //printf("I'm going to compact chunks %d and %d into one chunk...\n", addr1, addr2);
             chunk->size += sizeof(elmm_smallchunk_t) + chunk->next->size;
             chunk->next = chunk->next->next;
             result++;
