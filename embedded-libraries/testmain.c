@@ -21,7 +21,6 @@ void* ezsbrk(intptr_t incr, void* udata) {
 		if (bigarray == NULL) {
 			return ELMM_SBRK_ERROR;
 		}
-		printf("Successfully allocated bigarray at %x\n", bigarray);
 		bigarraytop = 0;
 	}
 	
