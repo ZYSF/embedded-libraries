@@ -10,5 +10,6 @@ An example use case is for Arduino programming, where features like "malloc" are
 ## Features
 
 * [Memory manager](embedded-libraries/elmm.h) (simple implementations of malloc/free/calloc/realloc-type functions)
+* A [very basic test program](embedded-libraries/testmain.c) (this only does a few calls to the memory manager and prints statistics)
 
 More will be added as requirements for other components are identified. (A partial implementation of printf is also present, but not usable yet.)
