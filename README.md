@@ -9,6 +9,6 @@ An example use case is for Arduino programming, where features like "malloc" are
 
 ## Features
 
-* Memory manager (simple implementations of malloc/free/calloc/realloc-type functions)
+* [Memory manager](embedded-libraries/elmm.h) (simple implementations of malloc/free/calloc/realloc-type functions)
 
 More will be added as requirements for other components are identified. (A partial implementation of printf is also present, but not usable yet.)
