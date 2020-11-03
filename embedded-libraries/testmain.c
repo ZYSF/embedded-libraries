@@ -51,6 +51,38 @@ void printstats(elmm_t* mm) {
 	printf("OVERHEADS: %d\n", stats[ELMM_STAT_OVERHEADS]);
 }
 
+int allocListTemp = 0;
+void* allocList(elmm_t* mm, int count) {
+	if (count <= 0) {
+		return NULL;
+	}
+	void** element = elmm_malloc(mm, sizeof(void*) + ((allocListTemp++) % 1234));
+	element[0] = allocList(mm, count - 1);
+	return element;
+}
+
+int freeListTemp = 0;
+int freeList(elmm_t* mm, void* list) {
+	if (list == NULL) {
+		return 0;
+	}
+	void* next = ((void**)list)[0];
+	if (((freeListTemp++) % 3) != 0) {
+		printf("A");
+		if (!elmm_free(mm, list)) {
+			return -1;
+		}
+		return freeList(mm, next) + 1;
+	} else {
+		printf("B");
+		int total = freeList(mm, next);
+		if (!elmm_free(mm, list)) {
+			return -1;
+		}
+		return total + 1;
+	}
+}
+
 bool test_basicmem(const char* testname) {
 	bigarray = NULL;
 	bigarraytop = 0;
@@ -96,6 +128,29 @@ bool test_basicmem(const char* testname) {
 	printstats(&mm);
 
 	if (!elmm_free(&mm, somemem2)) {
+		return false;
+	}
+
+	printstats(&mm);
+
+	if (elmm_fullcompact(&mm) < 0) {
+		return false;
+	}
+
+	printstats(&mm);
+
+	/* The allocList and freeList functions recursively allocate and free a list of differently-sized structures.
+	 * Deallocation sometimes happens in-order and sometimes out-of-order.
+	 */
+	int listDepth = 1000;
+	void* list = allocList(&mm, listDepth);
+	if (list == NULL) {
+		return false;
+	}
+	
+	printstats(&mm);
+
+	if (freeList(&mm, list) != listDepth) {
 		return false;
 	}
 
