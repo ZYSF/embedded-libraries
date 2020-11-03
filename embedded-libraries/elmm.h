@@ -138,7 +138,7 @@ ELMM_STATIC elmm_bigchunk_t* elmm_bigchunk_sbrk(uintptr_t size, elmm_bigchunk_t*
         if (data->onlyChunk != NULL) {
             return NULL;
         }
-        data->onlyChunk = (elmm_bigchunk_t*) data->func(size, data->udata);
+        data->onlyChunk = (elmm_bigchunk_t*)data->func(size, data->udata);
         if (data->onlyChunk == ELMM_SBRK_ERROR) {
             return NULL;
         }
@@ -147,8 +147,27 @@ ELMM_STATIC elmm_bigchunk_t* elmm_bigchunk_sbrk(uintptr_t size, elmm_bigchunk_t*
         data->onlyChunk->totalSize = size;
         data->onlyChunk->maximumSize = (data->max == 0) ? 1024 * 1024 * 1024 : data->max;
         return data->onlyChunk;
-    }
-    else {
+    } else if (size > 0 && oldchunk != NULL) {
+        //printf("Attempting to resize...\n");
+        if (data->onlyChunk != oldchunk) {
+            return NULL;
+        }
+        intptr_t diff = size - data->onlyChunk->totalSize;
+        void* sbrkresult = data->func(diff, data->udata);
+        // TODO: Should probably check that the sbrk function returned a pointer exactly where we expected
+        if (sbrkresult == ELMM_SBRK_ERROR) {
+            return NULL;
+        }
+        data->onlyChunk->totalSize = size;
+        return data->onlyChunk;
+    } else if (size == 0 && oldchunk != NULL) {
+        //printf("Attempting to deallocate...\n");
+        if (data->onlyChunk != oldchunk) {
+            return NULL;
+        }
+        //TODO...
+        return NULL;
+    } else {
         //printf("TODO!!!\n");
         return NULL;
     }
@@ -234,7 +253,7 @@ ELMM_INLINE uintptr_t elmm_innerstatpart(elmm_t* mm, elmm_smallchunk_t* listHead
  * chunk stats safely (maybe even require some explicit locking for the stats API to ensure consistency with
  * minimal interruption).
  */
-ELMM_STATIC uintptr_t elmm_innerstat(elmm_t* mm, int statnum) {
+ELMM_STATIC uintptr_t elmm_innerstat(elmm_t* mm, uintptr_t statnum) {
     elmm_bigchunk_t* chunk = mm->firstChunk;
     uintptr_t result = 0;
     switch (statnum) {
@@ -435,17 +454,58 @@ ELMM_INLINE bool elmm_cleanup(elmm_t* mm) {
     return true;
 }
 
+/* This function is called by elmm_growheap in order to resize a chunk. One important responsibility is to create a new
+ * smallchunk representing the allocated space.
+ */
+ELMM_INLINE bool elmm_growinner(elmm_t* mm, elmm_bigchunk_t* bigchunk, uintptr_t increment) {
+    increment += sizeof(elmm_bigchunk_t) + (sizeof(elmm_smallchunk_t) * 10); // This should more than cover the minimum overheads
+    if (increment < mm->bigchunkMinimum) {
+        increment = mm->bigchunkMinimum;
+    }
+    while ((increment % mm->bigchunkGranularity) != 0) {
+        increment++;
+    }
+    uintptr_t oldSize = bigchunk->totalSize;
+    uintptr_t newSize = oldSize + increment;
+    if (mm->bigchunkFunction(newSize, bigchunk, mm->bigchunkData) != bigchunk) {
+        //printf("The bigchunk function failed!\n");
+        return false;
+    }
+
+    /* It might be higher than our requested size, but we should indicate failure if it's lower. */
+    if (bigchunk->totalSize < newSize) {
+        //printf("The bigchunk function reported success but didn't allocate enough space\n");
+        return false;
+    }
+
+    /* Now we just need to calculate the address and size of the newChunk, initialise it's fields
+     * and add it to the free list.
+     */
+    elmm_smallchunk_t* newChunk = (elmm_smallchunk_t*)(((uint8_t*)bigchunk->startAddress) + oldSize);
+    //printf("The new chunk starts at %d\n", newChunk);
+    newChunk->check1 = ELMM_SMALLCHUNK_FREE;
+    newChunk->next = bigchunk->internals.firstFree;
+    bigchunk->internals.firstFree = newChunk;
+    newChunk->size = (bigchunk->totalSize - oldSize) - sizeof(elmm_smallchunk_t);
+    newChunk->check2 = ELMM_SMALLCHUNK_FREE;
+
+    //printf("Smallchunk size: %d\n", newChunk->size);
+
+    return true;
+}
+
 /* If not enough FREE smallchunks exist within the heap, this function will be
  * called to attempt to allocate more. It should return true if successful and
  * false otherwise.
  */
 ELMM_STATIC bool elmm_growheap(elmm_t* mm, uintptr_t increment) {
+    //printf("elmm_growheap(%d, %d)\n", mm, increment);
     if (!elmm_checkinit(mm)) {
         return false;
     }
     if (increment > 1024 * 1024 * 1024) {
         return false;
-        // TODO: Check against some better maximum increment?
+        // TODO: Check against some better maximum incr?
     }
     while ((increment % mm->bigchunkGranularity) != 0) {
         increment++;
@@ -457,11 +517,19 @@ ELMM_STATIC bool elmm_growheap(elmm_t* mm, uintptr_t increment) {
     elmm_bigchunk_t* lastValidChunk = chunk;
     while (chunk != NULL) {
         if (chunk->maximumSize >= (chunk->totalSize + increment)) {
-            // TODO: Resize chunk to fit and return true.
+            //printf("Looks like we can resize this chunk!\n");
+            if (elmm_growinner(mm, chunk, increment)) { // Only if it works should we return now!
+                return true;
+            }
+            /* Even if the maximum size indicates otherwise, there might be some reason the chunk
+             * can't be resized, so if growinner failed we need to continue and try to allocate
+             * somewhere else.
+             */
         }
         lastValidChunk = chunk;
         chunk = chunk->internals.nextChunk;
     }
+    //printf("Attempting to allocate a new chunk...\n");
     elmm_bigchunk_t* newChunk = elmm_allocinner(mm, increment);
     if (newChunk == NULL) {
         return false;
@@ -490,7 +558,7 @@ ELMM_STATIC uintptr_t elmm_stat(elmm_t* mm, uintptr_t* statArray, uintptr_t arra
     }
     void* result = NULL;
 
-    int i;
+    uintptr_t i;
     for (i = 0; i < arrayLength && i < ELMM_STATTOP; i++) {
         statArray[i] = elmm_innerstat(mm, i);
     }
@@ -517,7 +585,7 @@ ELMM_INLINE void* elmm_chunkymalloc(elmm_t* mm, elmm_bigchunk_t* bigchunk, uintp
                 uint8_t* rawbytes = (uint8_t*) chunk;
                 elmm_smallchunk_t* upperchunk = (elmm_smallchunk_t*)(rawbytes + sizeof(elmm_smallchunk_t) + size);
                 while ((((uintptr_t)upperchunk) % sizeof(elmm_smallchunk_t)) != 0) {
-                    upperchunk++;
+                    upperchunk = (elmm_smallchunk_t*) (((uintptr_t)upperchunk) + 1);
                 }
                 upperchunk->check1 = ELMM_SMALLCHUNK_FREE;
                 uintptr_t oldsize = chunk->size;
@@ -538,6 +606,8 @@ ELMM_INLINE void* elmm_chunkymalloc(elmm_t* mm, elmm_bigchunk_t* bigchunk, uintp
         chunkptr = &chunk->next;
         chunk = chunk->next;
     }
+
+    //printf("No fit in chunk %d\n", bigchunk);
 
     /* If no chunk was found, just return NULL. */
     return NULL;
@@ -578,8 +648,17 @@ ELMM_INLINE void* elmm_malloc(elmm_t* mm, uintptr_t size) {
 
     /* Only if the first allocation failed do we need to expand the heap and try again. */
     if (result == NULL) {
+        //printf("innermalloc failed, trying growheap...\n");
         if (elmm_growheap(mm, size)) { /* And only if the heap has actually be grown should we try again. */
+            //printf("growheap worked, trying malloc again...\n");
             result = elmm_innermalloc(mm, size);
+            if (result == NULL) {
+                //printf("That failed :(\n");
+            } else {
+                //printf("That worked :D\n");
+            }
+        } else {
+            //printf("growheap failed\n");
         }
     }
 
@@ -596,7 +675,7 @@ ELMM_INLINE elmm_bigchunk_t* elmm_innerchunk(elmm_t* mm, void* pointer) {
     while (chunk != NULL) {
         uintptr_t iptr = (uintptr_t)pointer;
         uintptr_t cptr = (uintptr_t)chunk->startAddress;
-        if (pointer >= cptr && pointer < cptr + chunk->totalSize) {
+        if (iptr >= cptr && iptr < cptr + chunk->totalSize) {
             return chunk;
         }
         chunk = chunk->internals.nextChunk;

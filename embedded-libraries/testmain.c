@@ -34,7 +34,7 @@ void* ezsbrk(intptr_t incr, void* udata) {
 
 	printf("GIVING %d MEMORY TO MM at %d\n", incr, result);
 
-	bigarray[0] = 'f';
+	//bigarray[0] = 'f';
 
 	return result;
 }
@@ -52,12 +52,16 @@ void printstats(elmm_t* mm) {
 }
 
 int allocListTemp = 0;
-void* allocList(elmm_t* mm, int count) {
+void* allocList(elmm_t* mm, int count, int maximumReservedSize) {
 	if (count <= 0) {
 		return NULL;
 	}
-	void** element = elmm_malloc(mm, sizeof(void*) + ((allocListTemp++) % 1234));
-	element[0] = allocList(mm, count - 1);
+	void** element = elmm_malloc(mm, sizeof(void*) + ((allocListTemp++ * 91) % maximumReservedSize));
+	if (element == NULL) {
+		printf("Uh-oh, we got a NULL - out of memory?\n");
+		return NULL;
+	}
+	element[0] = allocList(mm, count - 1, maximumReservedSize);
 	return element;
 }
 
@@ -140,14 +144,40 @@ bool test_basicmem(const char* testname) {
 	printstats(&mm);
 
 	/* The allocList and freeList functions recursively allocate and free a list of differently-sized structures.
-	 * Deallocation sometimes happens in-order and sometimes out-of-order.
+	 * Deallocation sometimes happens in-order and sometimes out-of-order. The list depth might need to change if
+	 * you get a stack overflow from the recursion though!
 	 */
 	int listDepth = 1000;
-	void* list = allocList(&mm, listDepth);
+	int maxReservedSize = 1234;
+
+	printf("Allocating a list of %d objects with up to %d bytes reserved\n", listDepth, maxReservedSize);
+	void* list = allocList(&mm, listDepth, maxReservedSize);
 	if (list == NULL) {
 		return false;
 	}
-	
+
+	printstats(&mm);
+
+	if (freeList(&mm, list) != listDepth) {
+		return false;
+	}
+
+	printstats(&mm);
+
+	if (elmm_fullcompact(&mm) < 0) {
+		return false;
+	}
+
+	printstats(&mm);
+
+	maxReservedSize = 3456;
+
+	printf("Allocating a list of %d objects with up to %d bytes reserved\n", listDepth, maxReservedSize);
+	list = allocList(&mm, listDepth, maxReservedSize);
+	if (list == NULL) {
+		return false;
+	}
+
 	printstats(&mm);
 
 	if (freeList(&mm, list) != listDepth) {
