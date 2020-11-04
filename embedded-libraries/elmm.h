@@ -249,9 +249,8 @@ ELMM_INLINE uintptr_t elmm_innerstatpart(elmm_t* mm, elmm_smallchunk_t* listHead
 }
 
 /* This function is only useful for getting statistics WHILE THE MEMORY MANAGER IS LOCKED OR NOT BEING USED! 
- * TODO: A cleaner API which locks the collector and fills an array with stats, and possibly a way to get
- * chunk stats safely (maybe even require some explicit locking for the stats API to ensure consistency with
- * minimal interruption).
+ * The elmm_stat function is designed for more regular use (it will lock the memory manager and collect
+ * all of the statistics consistently).
  */
 ELMM_STATIC uintptr_t elmm_innerstat(elmm_t* mm, uintptr_t statnum) {
     elmm_bigchunk_t* chunk = mm->firstChunk;
@@ -834,7 +833,7 @@ ELMM_INLINE intptr_t elmm_compact(elmm_t* mm/*, uintptr_t maxCycles*/) {
     }
 
     if (!mm->lockFunction(ELMM_LOCK_WAITLOCK, &mm->mainLock, mm->lockData)) {
-        return 0 - 1;
+        return -1;
     }
     intptr_t result = 0;
 
@@ -846,13 +845,21 @@ ELMM_INLINE intptr_t elmm_compact(elmm_t* mm/*, uintptr_t maxCycles*/) {
     }
 
     if (!mm->lockFunction(ELMM_LOCK_UNLOCK, &mm->mainLock, mm->lockData)) {
-        return 0 - 1;
+        return -1;
     }
 
     return result;
 }
 
-/* Just calls elmm_compact until either there's nothing more to compact or an error occurs. */
+/* Just calls elmm_compact until either there's nothing more to compact or an error occurs.
+ * NOTE: This should be threadsafe, in that the internal cycles perform locking, but if you
+ * continue allocating the whole time it's running it'll just keep compacting forever. This
+ * might be the desired behaviour in some scenarios (particularly if you have a dedicated
+ * compaction thread - you'd just call this and then run friendlycompact and sleep for a
+ * while if/when it returns - or if you need to perform compaction only at specific times
+ * this function might also do the trick) but for more general usage you'd probably just want
+ * to call elmm_friendlycompact regularly.
+ */
 ELMM_INLINE intptr_t elmm_fullcompact(elmm_t* mm) {
     intptr_t result = 0;
 
@@ -866,6 +873,114 @@ ELMM_INLINE intptr_t elmm_fullcompact(elmm_t* mm) {
     } else {
         return result;
     }
+}
+
+ELMM_INLINE intptr_t elmm_innertrim(elmm_t* mm, elmm_bigchunk_t* bigchunk) {
+    uintptr_t nalloc = elmm_innerstatpart(mm, bigchunk->internals.firstAllocated);
+    uintptr_t nfree = elmm_innerstatpart(mm, bigchunk->internals.firstFree);
+
+    /* This is the minimum size of a smallchunk worth returning to the system, equal to
+     * whatever's set as the bigchunk granularity except taking it's smallchunk header size
+     * into account.
+     */
+    uintptr_t mindealloc = mm->bigchunkGranularity - sizeof(elmm_smallchunk_t);
+
+    if (nalloc == 0) {
+        //printf("That's it, I'm deleting the whole chunk at %d\n", bigchunk);
+        if (bigchunk == mm->firstChunk) {
+            mm->firstChunk = bigchunk->internals.nextChunk;
+        }
+        if (bigchunk->internals.nextChunk != NULL) {
+            bigchunk->internals.prevChunk = bigchunk->internals.prevChunk;
+        }
+        if (mm->bigchunkFunction(0, bigchunk, mm->bigchunkData) != NULL) {
+            return -1;
+        }
+    } else if (bigchunk->maximumSize > 0 && nfree >= mindealloc) {
+        /* If the chunk is resizable and there's enough free memory that it'd be worth deallocating, then
+         * try to find a large chunk at the end of this bigchunk and resize. If the free space is too fragmented
+         * or not at the end of the chunk then we'll just have to leave it for later.
+         */
+        //printf("I'm looking for a chunk to deallocate inside %d\n", bigchunk);
+        elmm_smallchunk_t** smallchunkVar = &bigchunk->internals.firstFree;
+        elmm_smallchunk_t* smallchunk = *smallchunkVar;
+        while (smallchunk != NULL) {
+            if (smallchunk->size >= mindealloc) {
+                uintptr_t startaddr = (uintptr_t)bigchunk->startAddress;
+                uintptr_t addr = (uintptr_t)smallchunk;
+                /* If this smallchunk ends right at the end of the bigchunk or close enough that another chunk header wouldn't fit, then
+                 * let's trim it!
+                 */
+                if (addr + sizeof(elmm_smallchunk_t) + smallchunk->size >= startaddr + bigchunk->totalSize - sizeof(elmm_bigchunk_t)) {
+                    //printf("Okay I'm gonna trim some out of the smallchunk at %d with size %d\n", addr, smallchunk->size);
+                }
+                intptr_t actualDealloc = mm->bigchunkGranularity;
+                intptr_t newsz = smallchunk->size - actualDealloc;
+                if (newsz < 0) {
+                    /* Set the pointer to this chunk to a pointer to the next chunk (or NULL) instead. We don't have to worry about the
+                     * next iteration either, since we can return as soon as we yield some memory.
+                     */
+                    *smallchunkVar = smallchunk->next;
+                    //printf("I'm deleting that smallchunk entirely.\n");
+                } else {
+                    while (newsz >= mm->bigchunkGranularity && (bigchunk->totalSize - actualDealloc >= mm->bigchunkMinimum)) {
+                        newsz -= mm->bigchunkGranularity;
+                        actualDealloc += mm->bigchunkGranularity;
+                    }
+                    /* If we're only trimming part of this smallchunk we can leave the rest in place and just modify it's size. */
+                    smallchunk->size = newsz;
+                    //printf("I left it with a size of %d\n", smallchunk->size);
+                }
+                uintptr_t oldtotal = bigchunk->totalSize;
+                if (mm->bigchunkFunction(bigchunk->totalSize - actualDealloc, bigchunk, mm->bigchunkData) != bigchunk) {
+                    //printf("The bigchunk function failed.\n");
+                    return -1;
+                }
+
+                /* I guess it worked! But we'll return the actual size calculation in case it ended up zero or erroneous. */
+                return oldtotal - bigchunk->totalSize;
+            }
+            smallchunkVar = &smallchunk->next;
+            smallchunk = *smallchunkVar;
+        }
+    } else {
+        return 0;
+    }
+}
+
+/* Attempts partial compaction and then tries to yield any spare memory to the operating system (or at least
+ * back to the bigchunk allocator, whatever it wants to do with it). Returns the amount of memory yielded
+ * (zero if none can be yielded) or a negative value on error. Note that this doesn't attempt full compaction
+ * (to avoid locking the memory manager for too long - and also since it wouldn't be required if enough memory
+ * is free), it just runs one compaction cycle and then tries to trim the heap opportunistically.
+ */
+ELMM_INLINE intptr_t elmm_friendlycompact(elmm_t* mm) {
+    if (elmm_compact(mm) < 0) {
+        return -1;
+    }
+
+    if (!mm->lockFunction(ELMM_LOCK_WAITLOCK, &mm->mainLock, mm->lockData)) {
+        return -1;
+    }
+    intptr_t result = 0;
+
+    elmm_bigchunk_t* chunk = mm->firstChunk;
+    while (chunk != NULL) {
+        /* Get the pointer to the next chunk BEFORE trimming, in case this chunk gets yielded entirely. */
+        elmm_bigchunk_t* next = chunk->internals.nextChunk;
+        intptr_t nreleased = elmm_innertrim(mm, chunk);
+        if (nreleased < 0) {
+            return -1;
+        }
+        result += nreleased;
+        chunk = next;
+    }
+
+    if (!mm->lockFunction(ELMM_LOCK_UNLOCK, &mm->mainLock, mm->lockData)) {
+        return -1;
+    }
+
+    return result;
 }
 
 /* From ifndef at top of file: */

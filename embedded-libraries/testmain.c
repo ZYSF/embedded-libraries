@@ -186,9 +186,23 @@ bool test_basicmem(const char* testname) {
 
 	printstats(&mm);
 
+	printf("Running fullcompact...\n");
+
 	if (elmm_fullcompact(&mm) < 0) {
 		return false;
 	}
+
+	printstats(&mm);
+
+	void* tmp = elmm_malloc(&mm, 100);
+
+	printf("Running friendlycompact...\n");
+	intptr_t n;
+
+	if ((n = elmm_friendlycompact(&mm)) < 0) {
+		return false;
+	}
+	printf("The friendlycompact function released %d bytes\n", n);
 
 	printstats(&mm);
 
