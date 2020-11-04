@@ -16,13 +16,13 @@
  *  Works in both 32-bit and 64-bit builds (should also adapt to smaller or larger word sizes, should use appropriate types
  *  and sizeof instead of making assumptions but rounding values etc. may need to be adapted for more obscure cases.
  *  Will attempt to grow the heap if it runs out of memory (and should fail gracefully if it can't).
+ *  Will attempt to release whatever memory it can spare if you call elmm_friendlycompact.
  * NOT YET IMPLEMENTED:
  *  Only tested under very simple and fake conditions (see testmain.c), TODO: Proper stress tests (might be easy to hook up
  *  something like Lua which can take a memory manager callback and then just run some large Lua program, otherwise some
  *  kind of benchmark program might be a good basis for a test).
  *  Some debugging code has been left in for now (search "printf" to remove the debug lines, but some may be useful to
  *  indicate TODOs or errors etc. A separate "warning" callback might be added in the future for debugging memory issues.)
- *  Doesn't release memory back to the system until cleanup is called.
  *  Not very fast and may not have enough safeguards for some use cases, but hopefully will be enough for a starting point.
  */
 #ifndef ELMM_H
